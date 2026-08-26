@@ -1,0 +1,100 @@
+name: 雑学ch 毎日自動生成
+
+on:
+  schedule:
+    # UTC 21:00 = JST 6:00。時間を変えたい場合はここを書き換える(UTC基準)
+    - cron: "0 21 * * *"
+  workflow_dispatch: {}  # 手動実行ボタン(Actionsタブから動作確認用に実行できる)
+
+permissions:
+  contents: write  # data/output を自動コミットするために必要
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+
+    # VOICEVOX ENGINEをサイドカーコンテナとして起動しておく。
+    # このsandbox(Cowork開発環境)ではDocker Hubに到達できず動作確認できなかったが、
+    # GitHub Actionsのランナーは通常のインターネットアクセスがあるため取得できる想定。
+    services:
+      voicevox:
+        image: voicevox/voicevox_engine:cpu-latest
+        ports:
+          - 50021:50021
+
+    steps:
+      - name: リポジトリを取得
+        uses: actions/checkout@v4
+
+      - name: Python環境を用意
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 依存パッケージをインストール
+        run: pip install -r requirements.txt
+
+      - name: ネタ候補を収集(Wikipedia)
+        run: python3 scripts/fetch_trivia.py --count 3
+
+      - name: 台本を生成(Claude API)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python3 scripts/generate_script.py
+
+      - name: VOICEVOXの起動待ち
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:50021/version && break
+            echo "waiting for voicevox... ($i)"
+            sleep 2
+          done
+
+      - name: ナレーション音声を合成(VOICEVOX)
+        run: python3 scripts/synthesize_voice.py
+
+      - name: 日本語フォントを導入
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
+
+      - name: 動画を合成(テロップ・図解ベース)
+        run: python3 scripts/compose_video.py
+
+      - name: サムネイルを生成
+        run: python3 scripts/generate_thumbnail.py
+
+      - name: YouTubeにアップロード
+        env:
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          # 動作に自信が持てるまでは private のまま運用し、確認できたらこの行を消す
+          # (既定値は upload_video.py 側で "private")
+          # YOUTUBE_PRIVACY_STATUS: "public"
+        run: python3 scripts/upload_video.py
+
+      - name: 生成物をActionsのアーティファクトとして保存(確認用)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-output-${{ github.run_id }}
+          path: output/
+          retention-days: 14
+
+      - name: 状態ファイルをコミット
+        if: always()
+        run: |
+          git config user.name "zatsugaku-ch-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet && echo "変更なし" || git commit -m "daily: $(date -u +'%Y-%m-%d') の状態を更新"
+          git push
+
+      - name: 実行結果サマリー(異常検知)
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "## ✅ 本日は正常に完了しました" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ❌ 途中で失敗しました。上のログを確認してください" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "GitHubの通知設定次第では、Actions失敗時にリポジトリ所有者へ自動でメール通知が届きます" >> "$GITHUB_STEP_SUMMARY"
